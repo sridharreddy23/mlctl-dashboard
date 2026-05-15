@@ -17,6 +17,8 @@ else
     PYTHON_BIN=python3
 fi
 
+PORT="${PORT:-7500}"
+
 echo "🎨 Building frontend..."
 cd frontend
 npm install
@@ -28,7 +30,7 @@ cd backend
 $PYTHON_BIN -m venv venv
 source venv/bin/activate
 python -m pip install -r requirements.txt
-python main.py &
+PORT="$PORT" python main.py &
 BACKEND_PID=$!
 echo "✓ Backend started (PID: $BACKEND_PID)"
 
@@ -37,9 +39,9 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "MLCtl Dashboard is running!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "📱 App:      http://localhost:8000"
-echo "🔧 Backend:  http://localhost:8000"
-echo "📚 API Docs: http://localhost:8000/docs"
+echo "📱 App:      http://localhost:$PORT"
+echo "🔧 Backend:  http://localhost:$PORT"
+echo "📚 API Docs: http://localhost:$PORT/docs"
 echo ""
 echo "Press Ctrl+C to stop both servers"
 echo ""
