@@ -97,7 +97,7 @@
     <div class="bg-gradient-to-r from-blue-600 to-blue-700 rounded-xl shadow-sm p-6 text-white">
       <h2 class="text-lg font-semibold mb-2">MLCtl Dashboard</h2>
       <p class="text-blue-100 text-sm mb-4">Professional MediaLive Control Center</p>
-      <p class="text-xs text-blue-200">Version 1.0.0 • Built with Vue 3 + FastAPI</p>
+      <p class="text-xs text-blue-200">Version 1.1.0 • Built with Vue 3 + FastAPI</p>
     </div>
   </div>
 </template>
@@ -120,7 +120,8 @@ const formData = reactive({
 
 const handleConfigSubmit = async () => {
   if (!formData.client_id || !formData.client_secret || !formData.base_url || !formData.blip_domain) {
-    alert('All fields are required')
+    // Use store error messaging instead of native alert()
+    store.error = 'All fields are required'
     return
   }
 

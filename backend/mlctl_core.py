@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
+"""Core MLCtl logic — config, token management, restart helpers, and daemon workers."""
 
 import os
-import sys
 import time
 import json
-import signal
 import datetime
 import requests
-from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Dict, Any
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo
+
+from utils import (
+    APP_DIR, load_json, save_json, is_process_alive,
+    register_term_handler, JobLogger, format_time_until,
+)
+
 
 # ================= ENV =================
 
@@ -29,14 +34,19 @@ class MLCtlConfig:
 
     def validate(self):
         if not self.is_configured():
-            missing = [var for var in ["ML_CLIENT_ID", "ML_CLIENT_SECRET", "ML_BASE_URL", "ML_BLIP_DOMAIN"] 
+            missing = [var for var in ["ML_CLIENT_ID", "ML_CLIENT_SECRET", "ML_BASE_URL", "ML_BLIP_DOMAIN"]
                       if not os.environ.get(var)]
             raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 
 
 config = MLCtlConfig()
-JOBS_FILE = "/tmp/mlctl_jobs.json"
-CACHE_FILE = "/tmp/ml_token_cache.json"
+
+# State files now live in ~/.mlctl/ (secured directory) instead of /tmp
+JOBS_FILE = str(APP_DIR / "mlctl_jobs.json")
+CACHE_FILE = str(APP_DIR / "ml_token_cache.json")
+LOGS_DIR = str(APP_DIR / "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+
 
 # ================= TOKEN =================
 
@@ -45,10 +55,9 @@ def get_token():
     now = int(time.time())
 
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE) as f:
-            data = json.load(f)
-            if now < data.get("expiry", 0):
-                return data["access_token"]
+        data = load_json(CACHE_FILE)
+        if now < data.get("expiry", 0):
+            return data["access_token"]
 
     resp = requests.post(
         f"{config.base_url}/token/generate",
@@ -61,8 +70,7 @@ def get_token():
     token = data["access_token"]
     expiry = now + data.get("expires_in", 3600) - config.token_buffer
 
-    with open(CACHE_FILE, "w") as f:
-        json.dump({"access_token": token, "expiry": expiry}, f)
+    save_json(CACHE_FILE, {"access_token": token, "expiry": expiry})
 
     return token
 
@@ -110,7 +118,7 @@ def restart_with_retry(arn: str, retries=5):
     for i in range(1, retries + 1):
         try:
             restart_api(arn)
-        except Exception as e:
+        except Exception:
             time.sleep(5)
             continue
 
@@ -125,66 +133,49 @@ def restart_with_retry(arn: str, retries=5):
 # ================= JOB STORAGE =================
 
 def load_jobs() -> Dict[str, Any]:
-    if os.path.exists(JOBS_FILE):
-        with open(JOBS_FILE) as f:
-            return json.load(f)
-    return {}
+    return load_json(JOBS_FILE)
 
 
 def save_jobs(jobs: Dict[str, Any]):
-    Path(JOBS_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with open(JOBS_FILE, "w") as f:
-        json.dump(jobs, f, indent=2)
+    save_json(JOBS_FILE, jobs)
 
 
-def is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except:
-        return False
+# Re-export for backward compat
+is_alive = is_process_alive
 
 
 # ================= DAEMON WORKER =================
 
 def daemon_worker(job_id: str, arn: str, name: str, delay: float):
-    log_path = f"/tmp/mlctl_{job_id}.log"
+    log_path = os.path.join(LOGS_DIR, f"mlctl_{job_id}.log")
 
     os.setsid()
-    log = open(log_path, "w", buffering=1)
 
-    def write(msg: str):
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        log.write(f"[{ts}] {msg}\n")
+    with JobLogger(log_path) as logger:
+        register_term_handler(logger.write)
 
-    def handle_term(signum, frame):
-        write("Cancelled before execution")
-        os._exit(0)
+        try:
+            remaining = delay
+            while remaining > 0:
+                time.sleep(min(30, remaining))
+                remaining -= 30
 
-    signal.signal(signal.SIGTERM, handle_term)
+            jobs = load_jobs()
+            jobs[job_id]["status"] = "running"
+            save_jobs(jobs)
 
-    try:
-        remaining = delay
-        while remaining > 0:
-            time.sleep(min(30, remaining))
-            remaining -= 30
+            logger.write(f"Restarting {name}")
+            logger.write(f"ARN: {arn}")
 
-        jobs = load_jobs()
-        jobs[job_id]["status"] = "running"
-        save_jobs(jobs)
+            success = restart_with_retry(arn)
 
-        write(f"Restarting {name}")
-        write(f"ARN: {arn}")
+            jobs = load_jobs()
+            jobs[job_id]["status"] = "done" if success else "failed"
+            save_jobs(jobs)
 
-        success = restart_with_retry(arn)
+            logger.write("SUCCESS" if success else "FAILED")
 
-        jobs = load_jobs()
-        jobs[job_id]["status"] = "done" if success else "failed"
-        save_jobs(jobs)
-
-        write("SUCCESS" if success else "FAILED")
-
-    except Exception as e:
-        write(f"ERROR: {e}")
+        except Exception as e:
+            logger.write(f"ERROR: {e}")
 
     os._exit(0)

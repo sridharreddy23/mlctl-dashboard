@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
+"""MediaLive input URL add-on — AWS credential management and channel input operations."""
 
 import datetime
 import json
 import os
-import signal
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,22 +12,25 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 
+from utils import (
+    APP_DIR, load_json, save_json, is_process_alive,
+    register_term_handler, JobLogger,
+)
+
 
 DEFAULT_REGION = "us-east-1"
-DEFAULT_CHANNEL_ARNS = [
-    "arn:aws:medialive:us-east-1:149306543115:channel:2238084",
-    "arn:aws:medialive:us-east-1:149306543115:channel:771047",
-    "arn:aws:medialive:us-east-1:149306543115:channel:363722",
-]
 
-AWS_CREDENTIALS_FILE = Path("/tmp/mlctl_aws_credentials.json")
-MEDIALIVE_JOBS_FILE = "/tmp/mlctl_medialive_jobs.json"
-BACKUP_DIR = Path("/tmp/mlctl_input_backups")
+# State files now live in ~/.mlctl/ (secured, persistent)
+AWS_CREDENTIALS_FILE = APP_DIR / "aws_credentials.json"
+MEDIALIVE_JOBS_FILE = str(APP_DIR / "mlctl_medialive_jobs.json")
+BACKUP_DIR = APP_DIR / "input_backups"
+LOGS_DIR = APP_DIR / "logs"
+os.makedirs(str(LOGS_DIR), exist_ok=True)
 
 
 class AwsCredentials:
     def __init__(self):
-        stored = load_stored_credentials()
+        stored = _load_stored_credentials()
         self.access_key_id = os.environ.get("AWS_ACCESS_KEY_ID") or stored.get("access_key_id", "")
         self.secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or stored.get("secret_access_key", "")
         self.session_token = os.environ.get("AWS_SESSION_TOKEN") or stored.get("session_token", "")
@@ -37,6 +40,7 @@ class AwsCredentials:
             or stored.get("region")
             or DEFAULT_REGION
         )
+        self.exported_at = stored.get("exported_at", "")
 
     def is_configured(self) -> bool:
         return all([self.access_key_id, self.secret_access_key, self.session_token])
@@ -48,11 +52,12 @@ class AwsCredentials:
             "has_access_key": bool(self.access_key_id),
             "has_secret_key": bool(self.secret_access_key),
             "has_session_token": bool(self.session_token),
-            "access_key_preview": mask_secret(self.access_key_id),
+            "access_key_preview": _mask_secret(self.access_key_id),
+            "exported_at": self.exported_at if self.exported_at else None,
         }
 
 
-def mask_secret(value: str) -> Optional[str]:
+def _mask_secret(value: str) -> Optional[str]:
     if not value:
         return None
     if len(value) <= 8:
@@ -60,14 +65,14 @@ def mask_secret(value: str) -> Optional[str]:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def load_stored_credentials() -> Dict[str, str]:
+def _load_stored_credentials() -> Dict[str, str]:
     if not AWS_CREDENTIALS_FILE.exists():
         return {}
 
     try:
         with AWS_CREDENTIALS_FILE.open() as f:
             data = json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, IOError):
         return {}
 
     return {
@@ -75,23 +80,27 @@ def load_stored_credentials() -> Dict[str, str]:
         "secret_access_key": str(data.get("secret_access_key", "")).strip(),
         "session_token": str(data.get("session_token", "")).strip(),
         "region": str(data.get("region", "")).strip(),
+        "exported_at": str(data.get("exported_at", "")).strip(),
     }
 
 
-def save_stored_credentials(creds: "AwsCredentials"):
+def _save_stored_credentials(creds: AwsCredentials):
     if not creds.is_configured():
         return
 
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     data = {
         "access_key_id": creds.access_key_id,
         "secret_access_key": creds.secret_access_key,
         "session_token": creds.session_token,
         "region": creds.region,
+        "exported_at": now_iso,
     }
+    creds.exported_at = now_iso
     AWS_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with AWS_CREDENTIALS_FILE.open("w") as f:
         json.dump(data, f)
-    os.chmod(AWS_CREDENTIALS_FILE, 0o600)
+    os.chmod(str(AWS_CREDENTIALS_FILE), 0o600)
 
 
 def export_credentials(data: Dict[str, str]) -> AwsCredentials:
@@ -102,23 +111,23 @@ def export_credentials(data: Dict[str, str]) -> AwsCredentials:
     os.environ["AWS_REGION"] = region
     os.environ["AWS_DEFAULT_REGION"] = region
     creds = AwsCredentials()
-    save_stored_credentials(creds)
+    _save_stored_credentials(creds)
     return creds
 
 
 def export_shell_commands() -> str:
     creds = AwsCredentials()
     lines = [
-        f"export AWS_ACCESS_KEY_ID={shell_quote(creds.access_key_id)}",
-        f"export AWS_SECRET_ACCESS_KEY={shell_quote(creds.secret_access_key)}",
-        f"export AWS_SESSION_TOKEN={shell_quote(creds.session_token)}",
-        f"export AWS_REGION={shell_quote(creds.region)}",
-        f"export AWS_DEFAULT_REGION={shell_quote(creds.region)}",
+        f"export AWS_ACCESS_KEY_ID={_shell_quote(creds.access_key_id)}",
+        f"export AWS_SECRET_ACCESS_KEY={_shell_quote(creds.secret_access_key)}",
+        f"export AWS_SESSION_TOKEN={_shell_quote(creds.session_token)}",
+        f"export AWS_REGION={_shell_quote(creds.region)}",
+        f"export AWS_DEFAULT_REGION={_shell_quote(creds.region)}",
     ]
     return "\n".join(lines)
 
 
-def shell_quote(value: str) -> str:
+def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
@@ -151,33 +160,17 @@ def channel_id_from_arn(arn: str) -> str:
     return arn.split(":")[-1].split("/")[-1]
 
 
-def default_channels() -> List[Dict[str, str]]:
-    return [
-        {"name": f"MediaLive {channel_id_from_arn(arn)}", "arn": arn, "channel_id": channel_id_from_arn(arn)}
-        for arn in DEFAULT_CHANNEL_ARNS
-    ]
-
+# ================= JOB STORAGE =================
 
 def load_medialive_jobs() -> Dict[str, Any]:
-    if os.path.exists(MEDIALIVE_JOBS_FILE):
-        with open(MEDIALIVE_JOBS_FILE) as f:
-            return json.load(f)
-    return {}
+    return load_json(MEDIALIVE_JOBS_FILE)
 
 
 def save_medialive_jobs(jobs: Dict[str, Any]):
-    Path(MEDIALIVE_JOBS_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with open(MEDIALIVE_JOBS_FILE, "w") as f:
-        json.dump(jobs, f, indent=2)
+    save_json(MEDIALIVE_JOBS_FILE, jobs)
 
 
-def is_process_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
-
+# ================= CHANNEL OPERATIONS =================
 
 def describe_channel_input(client, channel_id: str) -> Dict[str, str]:
     channel = client.describe_channel(ChannelId=channel_id)
@@ -315,52 +308,44 @@ def medialive_worker(
     creds_data: Dict[str, str],
     precheck: bool,
 ):
-    log_path = f"/tmp/mlctl_medialive_{job_id}.log"
+    log_path = os.path.join(str(LOGS_DIR), f"mlctl_medialive_{job_id}.log")
     os.setsid()
-    log = open(log_path, "w", buffering=1)
 
-    def write(msg: str):
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        log.write(f"[{ts}] {msg}\n")
+    with JobLogger(log_path) as logger:
+        register_term_handler(logger.write)
 
-    def handle_term(signum, frame):
-        write("Cancelled before execution")
-        os._exit(0)
+        try:
+            remaining = delay
+            while remaining > 0:
+                step = min(30, remaining)
+                time.sleep(step)
+                remaining -= step
 
-    signal.signal(signal.SIGTERM, handle_term)
+            jobs = load_medialive_jobs()
+            if job_id in jobs:
+                jobs[job_id]["status"] = "running"
+                save_medialive_jobs(jobs)
 
-    try:
-        remaining = delay
-        while remaining > 0:
-            step = min(30, remaining)
-            time.sleep(step)
-            remaining -= step
+            logger.write(f"Updating MediaLive input for {channel_name}")
+            success = update_input_url(
+                arn=arn,
+                target_url=target_url,
+                mode=mode,
+                creds=credentials_from_data(creds_data),
+                precheck=precheck,
+                write=logger.write,
+            )
 
-        jobs = load_medialive_jobs()
-        if job_id in jobs:
-            jobs[job_id]["status"] = "running"
-            save_medialive_jobs(jobs)
-
-        write(f"Updating MediaLive input for {channel_name}")
-        success = update_input_url(
-            arn=arn,
-            target_url=target_url,
-            mode=mode,
-            creds=credentials_from_data(creds_data),
-            precheck=precheck,
-            write=write,
-        )
-
-        jobs = load_medialive_jobs()
-        if job_id in jobs:
-            jobs[job_id]["status"] = "done" if success else "failed"
-            save_medialive_jobs(jobs)
-        write("SUCCESS" if success else "FAILED")
-    except Exception as exc:
-        write(f"ERROR: {exc}")
-        jobs = load_medialive_jobs()
-        if job_id in jobs:
-            jobs[job_id]["status"] = "failed"
-            save_medialive_jobs(jobs)
+            jobs = load_medialive_jobs()
+            if job_id in jobs:
+                jobs[job_id]["status"] = "done" if success else "failed"
+                save_medialive_jobs(jobs)
+            logger.write("SUCCESS" if success else "FAILED")
+        except Exception as exc:
+            logger.write(f"ERROR: {exc}")
+            jobs = load_medialive_jobs()
+            if job_id in jobs:
+                jobs[job_id]["status"] = "failed"
+                save_medialive_jobs(jobs)
 
     os._exit(0)

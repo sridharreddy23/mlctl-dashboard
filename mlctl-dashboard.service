@@ -1,0 +1,25 @@
+# MLCtl Dashboard — systemd service unit
+#
+# Install:
+#   sudo cp mlctl-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mlctl-dashboard
+#
+# Logs:
+#   journalctl -u mlctl-dashboard -f
+
+[Unit]
+Description=MLCtl Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=amagi
+WorkingDirectory=/home/amagi/mlctl-dashboard
+ExecStart=/home/amagi/mlctl-dashboard/backend/venv/bin/python backend/main.py
+Environment=PORT=7654
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

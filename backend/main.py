@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
+"""MLCtl Dashboard API — FastAPI application with Pydantic request models."""
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+import asyncio
 import json
 import os
 import time
 import datetime
+import multiprocessing
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo
+
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project root if present
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from mlctl_core import (
-    config, get_token, get_status, restart_api, 
+    config, get_token, get_status, restart_api,
     load_jobs, save_jobs, is_alive, daemon_worker,
-    MLCtlConfig
+    MLCtlConfig, LOGS_DIR,
 )
 from medialive_addon import (
     AwsCredentials,
@@ -32,18 +42,71 @@ from medialive_addon import (
     load_medialive_jobs,
     medialive_worker,
     save_medialive_jobs,
+    LOGS_DIR as ML_LOGS_DIR,
 )
+from utils import format_time_until
 
-app = FastAPI(title="MLCtl Dashboard API", version="1.0.0")
+app = FastAPI(title="MLCtl Dashboard API", version="1.1.0")
 
-# CORS middleware
+# CORS middleware — restrict to known origins
+ALLOWED_ORIGINS = os.environ.get(
+    "MLCTL_CORS_ORIGINS",
+    "http://localhost:8000,http://localhost:5173,http://localhost:7500"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ================= PYDANTIC REQUEST MODELS =================
+
+class ConfigUpdate(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    base_url: str = ""
+    blip_domain: str = ""
+
+
+class ScheduleRequest(BaseModel):
+    channel_name: str = ""
+    arn: str
+    scheduled_time: str
+    timezone: str = "Asia/Kolkata"
+
+
+class AwsCredentialsUpdate(BaseModel):
+    access_key_id: str = ""
+    secret_access_key: str = ""
+    session_token: str = ""
+    region: str = "us-east-1"
+
+
+class MediaLiveInputDetailsRequest(BaseModel):
+    arn: str
+    access_key_id: str = ""
+    secret_access_key: str = ""
+    session_token: str = ""
+    region: str = "us-east-1"
+
+
+class MediaLiveScheduleRequest(BaseModel):
+    arn: str
+    channel_name: str = ""
+    mode: str = "update"
+    target_url: str = ""
+    scheduled_time: str
+    timezone: str = "Asia/Kolkata"
+    precheck: bool = True
+    access_key_id: str = ""
+    secret_access_key: str = ""
+    session_token: str = ""
+    region: str = "us-east-1"
+
 
 # ================= CONFIG ENDPOINTS =================
 
@@ -59,17 +122,17 @@ def get_config():
     }
 
 @app.post("/api/config")
-def update_config(data: dict):
+def update_config(data: ConfigUpdate):
     """Update configuration (sets environment variables)"""
-    os.environ["ML_CLIENT_ID"] = data.get("client_id", "")
-    os.environ["ML_CLIENT_SECRET"] = data.get("client_secret", "")
-    os.environ["ML_BASE_URL"] = data.get("base_url", "")
-    os.environ["ML_BLIP_DOMAIN"] = data.get("blip_domain", "")
-    
+    os.environ["ML_CLIENT_ID"] = data.client_id
+    os.environ["ML_CLIENT_SECRET"] = data.client_secret
+    os.environ["ML_BASE_URL"] = data.base_url
+    os.environ["ML_BLIP_DOMAIN"] = data.blip_domain
+
     # Reload config
     global config
     config = MLCtlConfig()
-    
+
     return {"status": "ok", "configured": config.is_configured()}
 
 # ================= CHANNELS ENDPOINTS =================
@@ -83,11 +146,13 @@ def load_channels_config() -> List[Dict[str, str]]:
         path = os.path.expanduser(CHANNELS_CONFIG_PATH)
         if not os.path.exists(path):
             raise HTTPException(status_code=404, detail="Channels config file not found")
-        
+
         with open(path) as f:
             channels = json.load(f)
-        
+
         return channels
+    except HTTPException:
+        raise
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Channels config file not found at {CHANNELS_CONFIG_PATH}")
     except Exception as e:
@@ -107,9 +172,9 @@ def get_aws_credentials():
     return AwsCredentials().masked()
 
 @app.post("/api/medialive/aws-credentials")
-def update_aws_credentials(data: dict):
+def update_aws_credentials(data: AwsCredentialsUpdate):
     """Export AWS credentials into the backend process environment."""
-    creds = export_credentials(data)
+    creds = export_credentials(data.dict())
     if not creds.is_configured():
         raise HTTPException(
             status_code=400,
@@ -142,15 +207,14 @@ def get_medialive_channels() -> List[Dict[str, str]]:
     return channels
 
 @app.post("/api/medialive/input-details")
-def get_medialive_input_details(data: dict):
+def get_medialive_input_details(data: MediaLiveInputDetailsRequest):
     """Describe the first input attached to a MediaLive channel."""
     try:
-        arn = data.get("arn", "")
-        if not arn:
+        if not data.arn:
             raise HTTPException(status_code=400, detail="Channel ARN is required")
-        creds = credentials_from_data(data)
+        creds = credentials_from_data(data.dict())
         client = get_client(creds)
-        channel_id = arn.split(":")[-1].split("/")[-1]
+        channel_id = data.arn.split(":")[-1].split("/")[-1]
         return describe_channel_input(client, channel_id)
     except HTTPException:
         raise
@@ -158,25 +222,19 @@ def get_medialive_input_details(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/medialive/schedule-input-url")
-def schedule_medialive_input_url(data: dict):
+def schedule_medialive_input_url(data: MediaLiveScheduleRequest):
     """Schedule a MediaLive input URL update or rollback."""
     try:
-        arn = data.get("arn", "")
-        channel_name = data.get("channel_name", "") or arn
-        mode = data.get("mode", "update")
-        target_url = data.get("target_url", "")
-        scheduled_time = data.get("scheduled_time", "")
-        timezone = data.get("timezone", "Asia/Kolkata")
-        precheck = bool(data.get("precheck", True))
+        channel_name = data.channel_name or data.arn
 
-        if not arn:
+        if not data.arn:
             raise HTTPException(status_code=400, detail="Channel ARN is required")
-        if mode not in ["update", "rollback"]:
+        if data.mode not in ["update", "rollback"]:
             raise HTTPException(status_code=400, detail="Mode must be update or rollback")
-        if mode == "update" and not target_url:
+        if data.mode == "update" and not data.target_url:
             raise HTTPException(status_code=400, detail="Target HLS URL is required")
 
-        creds = credentials_from_data(data)
+        creds = credentials_from_data(data.dict())
         if not creds.is_configured():
             raise HTTPException(
                 status_code=400,
@@ -184,8 +242,8 @@ def schedule_medialive_input_url(data: dict):
             )
 
         try:
-            zone = ZoneInfo(timezone)
-            dt = datetime.datetime.fromisoformat(scheduled_time)
+            zone = ZoneInfo(data.timezone)
+            dt = datetime.datetime.fromisoformat(data.scheduled_time)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=zone)
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -202,9 +260,9 @@ def schedule_medialive_input_url(data: dict):
         jobs = load_medialive_jobs()
         jobs[job_id] = {
             "name": channel_name,
-            "arn": arn,
-            "mode": mode,
-            "target_url": target_url if mode == "update" else "",
+            "arn": data.arn,
+            "mode": data.mode,
+            "target_url": data.target_url if data.mode == "update" else "",
             "pid": None,
             "time": dt.isoformat(),
             "status": "waiting",
@@ -219,13 +277,17 @@ def schedule_medialive_input_url(data: dict):
             "region": creds.region,
         }
 
-        pid = os.fork()
-        if pid == 0:
-            medialive_worker(job_id, arn, channel_name, target_url, mode, delay, creds_data, precheck)
-        else:
-            jobs = load_medialive_jobs()
-            jobs[job_id]["pid"] = pid
-            save_medialive_jobs(jobs)
+        # Use multiprocessing instead of os.fork() — safer with ASGI servers
+        p = multiprocessing.Process(
+            target=medialive_worker,
+            args=(job_id, data.arn, channel_name, data.target_url, data.mode, delay, creds_data, data.precheck),
+            daemon=True,
+        )
+        p.start()
+
+        jobs = load_medialive_jobs()
+        jobs[job_id]["pid"] = p.pid
+        save_medialive_jobs(jobs)
 
         return {
             "job_id": job_id,
@@ -242,26 +304,12 @@ def schedule_medialive_input_url(data: dict):
 def list_medialive_jobs() -> List[Dict[str, Any]]:
     """Get MediaLive input URL jobs."""
     jobs = load_medialive_jobs()
-    now = datetime.datetime.now(datetime.timezone.utc)
     result = []
 
     for job_id, job in jobs.items():
         status = job.get("status", "unknown")
         if status == "waiting" and not is_process_alive(job.get("pid", 0)):
             status = "failed"
-
-        try:
-            dt = datetime.datetime.fromisoformat(job["time"])
-            delta = dt.astimezone(datetime.timezone.utc) - now
-            secs = int(delta.total_seconds())
-            if secs > 0:
-                h, r = divmod(secs, 3600)
-                time_until = f"in {h}h {r//60}m"
-            else:
-                h, r = divmod(-secs, 3600)
-                time_until = f"{h}h {r//60}m ago"
-        except Exception:
-            time_until = "-"
 
         result.append({
             "id": job_id,
@@ -271,7 +319,7 @@ def list_medialive_jobs() -> List[Dict[str, Any]]:
             "target_url": job.get("target_url", ""),
             "status": status,
             "time": job.get("time", ""),
-            "time_until": time_until,
+            "time_until": format_time_until(job.get("time", "")),
             "pid": job.get("pid"),
         })
 
@@ -288,7 +336,7 @@ def cancel_medialive_job(job_id: str):
     if pid and is_process_alive(pid):
         try:
             os.kill(pid, 15)
-        except Exception:
+        except OSError:
             pass
 
     jobs[job_id]["status"] = "cancelled"
@@ -298,7 +346,7 @@ def cancel_medialive_job(job_id: str):
 @app.get("/api/medialive/jobs/{job_id}/logs")
 def get_medialive_logs(job_id: str):
     """Get MediaLive input URL job logs."""
-    log_path = f"/tmp/mlctl_medialive_{job_id}.log"
+    log_path = os.path.join(str(ML_LOGS_DIR), f"mlctl_medialive_{job_id}.log")
     if not os.path.exists(log_path):
         return {"logs": "", "exists": False}
     try:
@@ -322,67 +370,65 @@ def channel_status(arn: str):
 # ================= SCHEDULE ENDPOINTS =================
 
 @app.post("/api/schedule")
-def schedule_restart(data: dict):
+def schedule_restart(data: ScheduleRequest):
     """Schedule a channel restart"""
     try:
         # Validate configuration
         config.validate()
-        
+
         # Parse and validate datetime
         try:
-            scheduled_time = data.get("scheduled_time", "")
-            timezone = data.get("timezone", "Asia/Kolkata")
-            channel_name = data.get("channel_name", "")
-            arn = data.get("arn", "")
-            
-            zone = ZoneInfo(timezone)
-            dt = datetime.datetime.fromisoformat(scheduled_time)
-            
+            zone = ZoneInfo(data.timezone)
+            dt = datetime.datetime.fromisoformat(data.scheduled_time)
+
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=zone)
-            
+
             now = datetime.datetime.now(datetime.timezone.utc)
             if dt.astimezone(datetime.timezone.utc) < now:
                 raise HTTPException(status_code=400, detail="Scheduled time is in the past")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid datetime: {str(e)}")
-        
+
         # Calculate delay in seconds
-        delay = (dt.astimezone(datetime.timezone.utc) - 
+        delay = (dt.astimezone(datetime.timezone.utc) -
                 datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-        
+
         if delay <= 0:
             raise HTTPException(status_code=400, detail="Scheduled time is in the past")
-        
+
         # Create job
         job_id = f"job_{int(time.time())}"
         jobs = load_jobs()
         jobs[job_id] = {
-            "name": channel_name,
-            "arn": arn,
+            "name": data.channel_name,
+            "arn": data.arn,
             "pid": None,
             "time": dt.isoformat(),
             "status": "waiting",
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
         save_jobs(jobs)
-        
-        # Fork daemon process
-        pid = os.fork()
-        if pid == 0:
-            daemon_worker(job_id, arn, channel_name, delay)
-        else:
-            jobs = load_jobs()
-            jobs[job_id]["pid"] = pid
-            save_jobs(jobs)
-        
+
+        # Use multiprocessing instead of os.fork() — safer with ASGI servers
+        p = multiprocessing.Process(
+            target=daemon_worker,
+            args=(job_id, data.arn, data.channel_name, delay),
+            daemon=True,
+        )
+        p.start()
+
+        jobs = load_jobs()
+        jobs[job_id]["pid"] = p.pid
+        save_jobs(jobs)
+
         return {
             "job_id": job_id,
             "status": "scheduled",
             "scheduled_time": dt.isoformat(),
             "delay_seconds": delay
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -394,42 +440,26 @@ def schedule_restart(data: dict):
 def list_jobs() -> List[Dict[str, Any]]:
     """Get all jobs"""
     jobs = load_jobs()
-    now = datetime.datetime.now(datetime.timezone.utc)
     result = []
-    
+
     for job_id, job in jobs.items():
         name = job.get("name") or job.get("arn", "").split(":")[-1]
         status = job.get("status", "unknown")
-        
+
         # Check if process is still alive
         if status == "waiting" and not is_alive(job.get("pid", 0)):
             status = "failed"
-        
-        # Calculate time string
-        try:
-            dt = datetime.datetime.fromisoformat(job["time"])
-            delta = dt.astimezone(datetime.timezone.utc) - now
-            secs = int(delta.total_seconds())
-            
-            if secs > 0:
-                h, r = divmod(secs, 3600)
-                time_until = f"in {h}h {r//60}m"
-            else:
-                h, r = divmod(-secs, 3600)
-                time_until = f"{h}h {r//60}m ago"
-        except:
-            time_until = "-"
-        
+
         result.append({
             "id": job_id,
             "name": name,
             "arn": job.get("arn", ""),
             "status": status,
             "time": job.get("time", ""),
-            "time_until": time_until,
+            "time_until": format_time_until(job.get("time", "")),
             "pid": job.get("pid")
         })
-    
+
     return result
 
 @app.get("/api/jobs/{job_id}")
@@ -438,37 +468,22 @@ def get_job(job_id: str) -> Dict[str, Any]:
     jobs = load_jobs()
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
-    now = datetime.datetime.now(datetime.timezone.utc)
-    
+
     name = job.get("name") or job.get("arn", "").split(":")[-1]
     status = job.get("status", "unknown")
-    
+
     if status == "waiting" and not is_alive(job.get("pid", 0)):
         status = "failed"
-    
-    try:
-        dt = datetime.datetime.fromisoformat(job["time"])
-        delta = dt.astimezone(datetime.timezone.utc) - now
-        secs = int(delta.total_seconds())
-        
-        if secs > 0:
-            h, r = divmod(secs, 3600)
-            time_until = f"in {h}h {r//60}m"
-        else:
-            h, r = divmod(-secs, 3600)
-            time_until = f"{h}h {r//60}m ago"
-    except:
-        time_until = "-"
-    
+
     return {
         "id": job_id,
         "name": name,
         "arn": job.get("arn", ""),
         "status": status,
         "time": job.get("time", ""),
-        "time_until": time_until,
+        "time_until": format_time_until(job.get("time", "")),
         "pid": job.get("pid")
     }
 
@@ -478,19 +493,19 @@ def cancel_job(job_id: str):
     jobs = load_jobs()
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     pid = job.get("pid")
-    
+
     if pid and is_alive(pid):
         try:
             os.kill(pid, 15)  # SIGTERM
-        except:
+        except OSError:
             pass
-    
+
     job["status"] = "cancelled"
     save_jobs(jobs)
-    
+
     return {"status": "cancelled", "job_id": job_id}
 
 # ================= LOGS ENDPOINTS =================
@@ -498,11 +513,11 @@ def cancel_job(job_id: str):
 @app.get("/api/jobs/{job_id}/logs")
 def get_logs(job_id: str):
     """Get job logs"""
-    log_path = f"/tmp/mlctl_{job_id}.log"
-    
+    log_path = os.path.join(str(LOGS_DIR), f"mlctl_{job_id}.log")
+
     if not os.path.exists(log_path):
         return {"logs": "", "exists": False}
-    
+
     try:
         with open(log_path) as f:
             logs = f.read()
@@ -519,6 +534,99 @@ def health():
         "status": "ok",
         "configured": config.is_configured()
     }
+
+# ================= BULK CHANNEL STATUS =================
+
+@app.get("/api/channels/status")
+def get_all_channel_status():
+    """Get live status for all configured channels."""
+    channels = load_channels_config()
+    results = []
+    for ch in channels:
+        try:
+            status = get_status(ch["arn"])
+        except Exception:
+            status = "UNKNOWN"
+        results.append({**ch, "status": status})
+    return results
+
+# ================= PURGE ENDPOINTS =================
+
+class PurgeRequest(BaseModel):
+    days: int = 7
+
+@app.post("/api/jobs/purge")
+def purge_jobs(data: PurgeRequest):
+    """Delete jobs older than N days."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=data.days)
+    jobs = load_jobs()
+    kept = {}
+    removed = 0
+    for jid, job in jobs.items():
+        try:
+            created = datetime.datetime.fromisoformat(job.get("created_at", job.get("time", "")))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+            if created < cutoff and job.get("status") in ("done", "failed", "cancelled"):
+                removed += 1
+                continue
+        except Exception:
+            pass
+        kept[jid] = job
+    save_jobs(kept)
+
+    ml_jobs = load_medialive_jobs()
+    ml_kept = {}
+    for jid, job in ml_jobs.items():
+        try:
+            created = datetime.datetime.fromisoformat(job.get("created_at", job.get("time", "")))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+            if created < cutoff and job.get("status") in ("done", "failed", "cancelled"):
+                removed += 1
+                continue
+        except Exception:
+            pass
+        ml_kept[jid] = job
+    save_medialive_jobs(ml_kept)
+
+    return {"removed": removed, "remaining": len(kept) + len(ml_kept)}
+
+# ================= WEBSOCKET LIVE LOGS =================
+
+def _resolve_log_path(job_id: str) -> str:
+    """Find the log file for a job (regular or MediaLive)."""
+    for prefix, log_dir in [("mlctl_medialive_", str(ML_LOGS_DIR)), ("mlctl_", str(LOGS_DIR))]:
+        path = os.path.join(log_dir, f"{prefix}{job_id}.log")
+        if os.path.exists(path):
+            return path
+    # Fallback — try both possible paths
+    ml_path = os.path.join(str(ML_LOGS_DIR), f"mlctl_medialive_{job_id}.log")
+    reg_path = os.path.join(str(LOGS_DIR), f"mlctl_{job_id}.log")
+    return ml_path if job_id.startswith("mlinput_") else reg_path
+
+@app.websocket("/ws/logs/{job_id}")
+async def websocket_logs(websocket: WebSocket, job_id: str):
+    """Stream job logs in real-time via WebSocket."""
+    await websocket.accept()
+    log_path = _resolve_log_path(job_id)
+    last_size = 0
+    try:
+        while True:
+            if os.path.exists(log_path):
+                size = os.path.getsize(log_path)
+                if size > last_size:
+                    with open(log_path) as f:
+                        f.seek(last_size)
+                        chunk = f.read()
+                        if chunk:
+                            await websocket.send_text(chunk)
+                    last_size = size
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 # ================= FRONTEND =================
 
