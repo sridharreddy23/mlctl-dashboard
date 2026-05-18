@@ -39,8 +39,8 @@ A professional, full-featured web application for managing MediaLive channel res
 
 ## Prerequisites
 
-- Python 3.8+
-- Node.js 16+
+- Python 3.8+ (tested on Ubuntu 18 with `python3.8`)
+- Node.js 16.x only (`nvm use` reads `.nvmrc`)
 - npm or yarn
 
 ## Installation & Setup

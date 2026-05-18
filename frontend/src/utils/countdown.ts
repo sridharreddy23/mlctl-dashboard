@@ -1,10 +1,10 @@
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 
 /**
  * Composable that provides a reactive, auto-updating relative time string.
  * Updates every second for active countdowns.
  */
-export function useCountdown(isoTime: () => string) {
+export function useCountdown(isoTime: () => string, isActive: () => boolean) {
   const display = ref('')
   let timer: ReturnType<typeof setInterval> | null = null
 
@@ -31,10 +31,17 @@ export function useCountdown(isoTime: () => string) {
     }
   }
 
-  onMounted(() => {
+  watch(isActive, (active) => {
+    if (active) {
+      if (!timer) timer = setInterval(update, 1000)
+    } else {
+      if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
     update()
-    timer = setInterval(update, 1000)
-  })
+  }, { immediate: true })
 
   onUnmounted(() => {
     if (timer) clearInterval(timer)

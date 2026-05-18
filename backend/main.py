@@ -13,6 +13,7 @@ import os
 import time
 import datetime
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from zoneinfo import ZoneInfo
@@ -26,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from mlctl_core import (
-    config, get_token, get_status, restart_api,
+    config, get_token, get_status, get_status_with_token, restart_api,
     load_jobs, save_jobs, is_alive, daemon_worker,
     MLCtlConfig, LOGS_DIR,
 )
@@ -140,21 +141,63 @@ def update_config(data: ConfigUpdate):
 CHANNELS_CONFIG_PATH = "~/bin/config/channels.json"
 
 
+def normalize_channel_entry(entry: Any) -> Dict[str, str]:
+    """Normalize channels.json entries to {name, arn}."""
+    if isinstance(entry, str):
+        arn = entry.strip()
+        return {"name": arn.split(":")[-1] if arn else "Channel", "arn": arn}
+    if not isinstance(entry, dict):
+        raise ValueError("Each channel must be an object with name and arn")
+
+    arn = (
+        entry.get("arn")
+        or entry.get("ARN")
+        or entry.get("channel_arn")
+        or entry.get("channelArn")
+        or ""
+    ).strip()
+    name = (
+        entry.get("name")
+        or entry.get("Name")
+        or entry.get("channel_name")
+        or entry.get("channelName")
+        or (arn.split(":")[-1] if arn else "Channel")
+    )
+    if not arn:
+        raise ValueError("Channel entry missing arn")
+    return {"name": str(name), "arn": arn}
+
+
 def load_channels_config() -> List[Dict[str, str]]:
     """Load channels from config file."""
     try:
         path = os.path.expanduser(CHANNELS_CONFIG_PATH)
         if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail="Channels config file not found")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Channels config file not found at {CHANNELS_CONFIG_PATH}",
+            )
 
         with open(path) as f:
-            channels = json.load(f)
+            raw = json.load(f)
 
-        return channels
+        if isinstance(raw, dict):
+            if "channels" in raw and isinstance(raw["channels"], list):
+                raw = raw["channels"]
+            else:
+                raw = [raw]
+
+        if not isinstance(raw, list):
+            raise HTTPException(status_code=500, detail="channels.json must be a JSON array")
+
+        return [normalize_channel_entry(item) for item in raw]
     except HTTPException:
         raise
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Channels config file not found at {CHANNELS_CONFIG_PATH}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Channels config file not found at {CHANNELS_CONFIG_PATH}",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -242,7 +285,8 @@ def schedule_medialive_input_url(data: MediaLiveScheduleRequest):
             )
 
         try:
-            zone = ZoneInfo(data.timezone)
+            tz_name = data.timezone.replace("Asia/Calcutta", "Asia/Kolkata")
+            zone = ZoneInfo(tz_name)
             dt = datetime.datetime.fromisoformat(data.scheduled_time)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=zone)
@@ -378,7 +422,8 @@ def schedule_restart(data: ScheduleRequest):
 
         # Parse and validate datetime
         try:
-            zone = ZoneInfo(data.timezone)
+            tz_name = data.timezone.replace("Asia/Calcutta", "Asia/Kolkata")
+            zone = ZoneInfo(tz_name)
             dt = datetime.datetime.fromisoformat(data.scheduled_time)
 
             if dt.tzinfo is None:
@@ -508,6 +553,57 @@ def cancel_job(job_id: str):
 
     return {"status": "cancelled", "job_id": job_id}
 
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    """Reschedule a completed or failed job (runs after a short delay)."""
+    jobs = load_jobs()
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    old = jobs[job_id]
+    status = old.get("status", "unknown")
+    if status in ("waiting", "running"):
+        raise HTTPException(status_code=400, detail="Cannot retry an active job")
+
+    arn = old.get("arn", "")
+    if not arn:
+        raise HTTPException(status_code=400, detail="Job has no channel ARN")
+
+    name = old.get("name") or arn.split(":")[-1]
+    delay = 60.0
+    dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay)
+
+    new_job_id = f"job_{int(time.time())}"
+    jobs[new_job_id] = {
+        "name": name,
+        "arn": arn,
+        "pid": None,
+        "time": dt.isoformat(),
+        "status": "waiting",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    save_jobs(jobs)
+
+    p = multiprocessing.Process(
+        target=daemon_worker,
+        args=(new_job_id, arn, name, delay),
+        daemon=True,
+    )
+    p.start()
+
+    jobs = load_jobs()
+    jobs[new_job_id]["pid"] = p.pid
+    save_jobs(jobs)
+
+    return {
+        "job_id": new_job_id,
+        "status": "scheduled",
+        "scheduled_time": dt.isoformat(),
+        "delay_seconds": delay,
+        "retried_from": job_id,
+    }
+
 # ================= LOGS ENDPOINTS =================
 
 @app.get("/api/jobs/{job_id}/logs")
@@ -539,16 +635,61 @@ def health():
 
 @app.get("/api/channels/status")
 def get_all_channel_status():
-    """Get live status for all configured channels."""
-    channels = load_channels_config()
-    results = []
-    for ch in channels:
+    """Get live status for all configured channels via Cloudport MediaLive status API."""
+    if not config.is_configured():
+        return {
+            "configured": False,
+            "channels": [],
+            "message": "API not configured. Set Client ID, Secret, Base URL, and BLIP Domain in Settings.",
+        }
+
+    try:
+        channels = load_channels_config()
+    except HTTPException as exc:
+        return {
+            "configured": True,
+            "channels": [],
+            "message": exc.detail,
+        }
+
+    if not channels:
+        return {
+            "configured": True,
+            "channels": [],
+            "message": "No channels in channels.json.",
+        }
+
+    try:
+        token = get_token()
+    except Exception as exc:
+        return {
+            "configured": True,
+            "channels": [],
+            "message": f"Failed to authenticate: {exc}",
+        }
+
+    def fetch_one(ch: Dict[str, str]) -> Dict[str, Any]:
+        entry = {**ch, "status": "UNKNOWN", "error": None}
         try:
-            status = get_status(ch["arn"])
-        except Exception:
-            status = "UNKNOWN"
-        results.append({**ch, "status": status})
-    return results
+            entry["status"] = get_status_with_token(ch["arn"], token, timeout=12)
+        except Exception as exc:
+            entry["error"] = str(exc)
+        return entry
+
+    # Fetch all channels in parallel (much faster than sequential calls)
+    max_workers = min(100, max(1, len(channels)))
+    results: List[Dict[str, Any]] = [None] * len(channels)  # type: ignore
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(fetch_one, ch): idx for idx, ch in enumerate(channels)}
+        for future in as_completed(future_map):
+            results[future_map[future]] = future.result()
+
+    return {
+        "configured": True,
+        "channels": results,
+        "message": None,
+    }
 
 # ================= PURGE ENDPOINTS =================
 

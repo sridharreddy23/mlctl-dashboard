@@ -43,6 +43,21 @@ else
     echo "  ⚠ Frontend node_modules not installed"
 fi
 
+# Optional build check
+if command -v npm >/dev/null 2>&1 && [ -d frontend/node_modules ]; then
+    if (cd frontend && npm run build >/dev/null 2>&1); then
+        echo "  ✓ Frontend builds successfully"
+    else
+        echo "  ⚠ Frontend build failed (run: cd frontend && npm run build)"
+    fi
+fi
+
+if command -v python3.8 >/dev/null 2>&1; then
+    if python3.8 -c "import fastapi" 2>/dev/null; then
+        echo "  ✓ Python 3.8 can import FastAPI"
+    fi
+fi
+
 echo ""
 echo "✨ All checks passed!"
 echo ""

@@ -98,8 +98,10 @@ def _save_stored_credentials(creds: AwsCredentials):
     }
     creds.exported_at = now_iso
     AWS_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with AWS_CREDENTIALS_FILE.open("w") as f:
+    tmp_path = str(AWS_CREDENTIALS_FILE) + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f)
+    os.replace(tmp_path, str(AWS_CREDENTIALS_FILE))
     os.chmod(str(AWS_CREDENTIALS_FILE), 0o600)
 
 

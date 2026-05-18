@@ -5,8 +5,9 @@ import os
 import time
 import json
 import datetime
+import threading
 import requests
-from typing import Dict, Any
+from typing import Dict, Any, Union
 
 try:
     from zoneinfo import ZoneInfo
@@ -50,42 +51,97 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ================= TOKEN =================
 
+_token_lock = threading.Lock()
+
 def get_token():
-    config.validate()
-    now = int(time.time())
+    with _token_lock:
+        config.validate()
+        now = int(time.time())
 
-    if os.path.exists(CACHE_FILE):
-        data = load_json(CACHE_FILE)
-        if now < data.get("expiry", 0):
-            return data["access_token"]
+        if os.path.exists(CACHE_FILE):
+            data = load_json(CACHE_FILE)
+            if now < data.get("expiry", 0):
+                return data["access_token"]
 
-    resp = requests.post(
-        f"{config.base_url}/token/generate",
-        auth=(config.client_id, config.client_secret),
-        data={"grant_type": "client_credentials"},
-    )
-    resp.raise_for_status()
+        resp = requests.post(
+            f"{config.base_url}/token/generate",
+            auth=(config.client_id, config.client_secret),
+            data={"grant_type": "client_credentials"},
+            timeout=15,
+        )
+        resp.raise_for_status()
 
-    data = resp.json()
-    token = data["access_token"]
-    expiry = now + data.get("expires_in", 3600) - config.token_buffer
+        data = resp.json()
+        token = data["access_token"]
+        expiry = now + data.get("expires_in", 3600) - config.token_buffer
 
-    save_json(CACHE_FILE, {"access_token": token, "expiry": expiry})
+        save_json(CACHE_FILE, {"access_token": token, "expiry": expiry})
 
-    return token
+        return token
 
 
 # ================= API =================
 
-def get_status(arn: str):
-    token = get_token()
+# MediaLive states returned by Cloudport status API
+MEDIALIVE_STATES = frozenset({
+    "RUNNING", "IDLE", "STARTING", "STOPPING", "UNKNOWN",
+})
+
+
+def parse_channel_state(payload: Union[Dict[str, Any], str, None]) -> str:
+    """Normalize Cloudport status JSON to a MediaLive state string."""
+    if payload is None:
+        return "UNKNOWN"
+    if isinstance(payload, str):
+        return payload.strip().upper() or "UNKNOWN"
+    if not isinstance(payload, dict):
+        return "UNKNOWN"
+
+    for key in (
+        "state", "status", "channelState", "channel_state",
+        "State", "Status", "mediaLiveChannelState",
+    ):
+        if key not in payload or payload[key] in (None, ""):
+            continue
+        value = payload[key]
+        if isinstance(value, dict):
+            return parse_channel_state(value)
+        normalized = str(value).strip().upper()
+        if normalized:
+            return normalized
+
+    if "data" in payload and isinstance(payload["data"], dict):
+        return parse_channel_state(payload["data"])
+    if "result" in payload and isinstance(payload["result"], dict):
+        return parse_channel_state(payload["result"])
+
+    return "UNKNOWN"
+
+
+def get_status_with_token(arn: str, token: str, timeout: int = 12) -> str:
+    """Fetch channel status using a pre-fetched OAuth token (for parallel bulk refresh)."""
+    if not arn or not arn.strip():
+        raise ValueError("Channel ARN is required")
+
+    url = f"{config.base_url.rstrip('/')}/cloudport/medialive/{config.blip_domain}/status"
     resp = requests.get(
-        f"{config.base_url}/cloudport/medialive/{config.blip_domain}/status",
-        params={"arn": arn},
+        url,
+        params={"arn": arn.strip()},
         headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
     )
     resp.raise_for_status()
-    return resp.json().get("state", "UNKNOWN")
+    state = parse_channel_state(resp.json())
+    if state not in MEDIALIVE_STATES:
+        return state if state else "UNKNOWN"
+    return state
+
+
+def get_status(arn: str) -> str:
+    """GET /cloudport/medialive/<blip_domain>/status?arn=<channel_arn>"""
+    config.validate()
+    token = get_token()
+    return get_status_with_token(arn, token)
 
 
 def restart_api(arn: str):
@@ -94,6 +150,7 @@ def restart_api(arn: str):
         f"{config.base_url}/cloudport/medialive/{config.blip_domain}/restart",
         headers={"Authorization": f"Bearer {token}"},
         json={"arn": arn},
+        timeout=15,
     )
     resp.raise_for_status()
 
@@ -177,5 +234,9 @@ def daemon_worker(job_id: str, arn: str, name: str, delay: float):
 
         except Exception as e:
             logger.write(f"ERROR: {e}")
+            jobs = load_jobs()
+            if job_id in jobs:
+                jobs[job_id]["status"] = "failed"
+                save_jobs(jobs)
 
     os._exit(0)

@@ -53,6 +53,19 @@ export interface Toast {
   type: 'success' | 'error' | 'warning' | 'info'
 }
 
+export interface ChannelStatusItem {
+  name: string
+  arn: string
+  status: string
+  error?: string | null
+}
+
+export interface ChannelStatusResult {
+  configured?: boolean
+  channels: ChannelStatusItem[]
+  message?: string | null
+}
+
 let toastIdCounter = 0
 
 export const useStore = defineStore('main', () => {
@@ -191,6 +204,32 @@ export const useStore = defineStore('main', () => {
       await api.post(`/jobs/${jobId}/cancel`)
       setSuccess(`Job ${jobId} cancelled`)
       await fetchJobs()
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message)
+      throw err
+    } finally {
+      loading.value = false
+    }
+  }
+
+  const checkHealth = async (): Promise<{ status: string; configured: boolean }> => {
+    const response = await api.get('/health')
+    return response.data
+  }
+
+  const fetchChannelStatuses = async (): Promise<ChannelStatusResult | ChannelStatusItem[]> => {
+    const response = await api.get('/channels/status', { timeout: 120000 })
+    return response.data
+  }
+
+  const retryJob = async (jobId: string) => {
+    try {
+      loading.value = true
+      clearMessages()
+      const response = await api.post(`/jobs/${jobId}/retry`)
+      setSuccess(`Job rescheduled: ${response.data.job_id}`)
+      await fetchJobs()
+      return response.data
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message)
       throw err
@@ -386,11 +425,10 @@ export const useStore = defineStore('main', () => {
     activeJobs, completedJobs, activeMediaLiveJobs,
     addToast, removeToast, clearMessages,
     fetchConfig, updateConfig, fetchChannels,
-    fetchJobs, getJob, scheduleRestart, cancelJob, getJobLogs, getChannelStatus,
+    fetchJobs, getJob, scheduleRestart, cancelJob, retryJob, checkHealth, fetchChannelStatuses, getJobLogs, getChannelStatus,
     purgeJobs, exportJobsCSV,
     fetchAwsCredentials, updateAwsCredentials, getAwsExportCommands,
     fetchMediaLiveChannels, getMediaLiveInputDetails,
     fetchMediaLiveJobs, scheduleMediaLiveInputUrl, cancelMediaLiveJob, getMediaLiveJobLogs,
-    api
   }
 })

@@ -52,12 +52,14 @@ def load_json(path: str) -> Dict[str, Any]:
 
 
 def save_json(path: str, data: Dict[str, Any]) -> None:
-    """Save a JSON file with an exclusive (write) lock."""
+    """Save a JSON file atomically (write tmp → rename) with an exclusive lock."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(data, f, indent=2)
         fcntl.flock(f, fcntl.LOCK_UN)
+    os.replace(tmp, path)
 
 
 # --------------- Process helpers ---------------

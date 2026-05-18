@@ -7,7 +7,9 @@ echo "🚀 Starting MLCtl Dashboard..."
 
 # Load environment variables if .env exists
 if [ -f .env ]; then
-    export $(cat .env | xargs)
+    set -a
+    source .env
+    set +a
     echo "✓ Environment variables loaded"
 fi
 
@@ -34,6 +36,9 @@ PORT="$PORT" python main.py &
 BACKEND_PID=$!
 echo "✓ Backend started (PID: $BACKEND_PID)"
 
+# Clean shutdown on Ctrl+C
+trap "echo ''; echo 'Stopping...'; kill $BACKEND_PID 2>/dev/null; exit 0" INT TERM
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "MLCtl Dashboard is running!"
@@ -43,7 +48,7 @@ echo "📱 App:      http://localhost:$PORT"
 echo "🔧 Backend:  http://localhost:$PORT"
 echo "📚 API Docs: http://localhost:$PORT/docs"
 echo ""
-echo "Press Ctrl+C to stop both servers"
+echo "Press Ctrl+C to stop"
 echo ""
 
 # Wait for backend process

@@ -1,151 +1,162 @@
 <template>
   <div class="space-y-6">
-    <!-- AWS Credentials -->
-    <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
-      <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-5">
-        <div>
-          <h2 class="text-lg font-semibold text-slate-900 dark:text-white">AWS Credentials</h2>
-          <p class="text-sm text-slate-600 dark:text-slate-400">Export temporary AWS keys for MediaLive input changes.</p>
-        </div>
-        <div class="flex items-center gap-2">
-          <!-- Token expiry warning -->
-          <span v-if="tokenExpiryWarning" class="inline-flex px-3 py-1 rounded-full text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200">
-            ⚠️ {{ tokenExpiryWarning }}
-          </span>
-          <span :class="['inline-flex px-3 py-1 rounded-full text-xs font-medium', store.awsCredentials?.configured ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200']">
-            {{ store.awsCredentials?.configured ? 'Configured' : 'Not configured' }}
-          </span>
-        </div>
-      </div>
-
-      <!-- Paste Helper -->
-      <div class="mb-4">
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Quick Paste (JSON, CLI, or Export commands)</label>
-        <textarea
-          v-model="pasteInput"
-          @input="parsePastedCredentials"
-          rows="3"
-          class="input-field font-mono text-xs"
-          placeholder='Paste AWS JSON, aws configure output, or export commands...\n{"AccessKeyId": "...", "SecretAccessKey": "...", "SessionToken": "..."}'
-        ></textarea>
-        <p v-if="pasteStatus" class="mt-1 text-xs" :class="pasteStatus === 'Parsed!' ? 'text-green-600' : 'text-slate-500'">{{ pasteStatus }}</p>
-      </div>
-
-      <form @submit.prevent="saveAwsCredentials" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Access Key</label>
-          <input v-model="awsForm.access_key_id" type="text" required class="input-field" placeholder="AWS_ACCESS_KEY_ID" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Secret Key</label>
-          <input v-model="awsForm.secret_access_key" type="password" required class="input-field" placeholder="AWS_SECRET_ACCESS_KEY" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Session Token</label>
-          <input v-model="awsForm.session_token" type="password" required class="input-field" placeholder="AWS_SESSION_TOKEN" />
-        </div>
-        <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Region</label>
-          <input v-model="awsForm.region" type="text" required class="input-field" placeholder="us-east-1" />
-        </div>
-        <div class="lg:col-span-2 flex flex-col sm:flex-row gap-3">
-          <button type="submit" :disabled="store.loading" class="btn-primary">{{ store.loading ? 'Exporting...' : 'Export Credentials' }}</button>
-          <button type="button" @click="showExportCommands" class="btn-secondary">Show Export Commands</button>
-        </div>
-      </form>
-      <pre v-if="exportCommands" class="mt-4 whitespace-pre-wrap rounded-lg bg-slate-950 text-slate-100 p-4 text-xs overflow-x-auto">{{ exportCommands }}</pre>
+    <div>
+      <h2 class="page-title">MediaLive Inputs</h2>
+      <p class="page-subtitle">AWS credentials and scheduled input URL changes</p>
     </div>
 
+    <!-- AWS Credentials -->
+    <UiCard>
+      <template #header>
+        <div>
+          <h2 class="text-lg font-semibold text-slate-900 dark:text-white">AWS Credentials</h2>
+          <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">Export temporary AWS keys for MediaLive input changes.</p>
+        </div>
+      </template>
+      <template #actions>
+        <div class="flex items-center gap-2">
+          <span v-if="tokenExpiryWarning" class="badge bg-warning-100 text-warning-800 dark:bg-warning-900 dark:text-warning-200">
+            ⚠️ {{ tokenExpiryWarning }}
+          </span>
+          <UiBadge
+            :label="store.awsCredentials?.configured ? 'Configured' : 'Not configured'"
+            :variant="store.awsCredentials?.configured ? 'primary' : 'neutral'"
+          />
+        </div>
+      </template>
+
+      <!-- Paste Helper (collapsible) -->
+      <div class="mb-4">
+        <button
+          type="button"
+          class="flex w-full items-center justify-between rounded-lg border border-slate-200 px-4 py-2.5 text-sm text-slate-600 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-700/50"
+          @click="showPasteHelper = !showPasteHelper"
+        >
+          <span class="font-medium">Import credentials (JSON / export commands)</span>
+          <ChevronDown class="h-4 w-4 transition-transform duration-200" :class="{ 'rotate-180': showPasteHelper }" />
+        </button>
+        <div v-if="showPasteHelper" class="mt-2">
+          <textarea
+            v-model="pasteInput"
+            @input="parsePastedCredentials"
+            rows="3"
+            class="input-field font-mono text-xs"
+            placeholder='{"AccessKeyId": "...", "SecretAccessKey": "...", "SessionToken": "..."}'
+          ></textarea>
+          <p v-if="pasteStatus" class="mt-1 text-xs" :class="pasteStatus === 'Parsed!' ? 'text-success-600' : 'text-slate-500'">{{ pasteStatus }}</p>
+        </div>
+      </div>
+
+      <form @submit.prevent="saveAwsCredentials" class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <UiInput v-model="awsForm.access_key_id" label="Access Key" placeholder="AWS_ACCESS_KEY_ID" required />
+        <UiInput v-model="awsForm.secret_access_key" label="Secret Key" type="password" placeholder="AWS_SECRET_ACCESS_KEY" required />
+        <UiInput v-model="awsForm.session_token" label="Session Token" type="password" placeholder="AWS_SESSION_TOKEN" required />
+        <UiInput v-model="awsForm.region" label="Region" placeholder="us-east-1" required />
+        <div class="flex flex-col gap-3 sm:flex-row lg:col-span-2">
+          <UiButton type="submit" variant="primary" :loading="store.loading">Export Credentials</UiButton>
+          <UiButton type="button" variant="secondary" @click="showExportCommands">Show Export Commands</UiButton>
+        </div>
+      </form>
+      <pre v-if="exportCommands" class="mt-4 overflow-x-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-4 text-xs text-slate-100">{{ exportCommands }}</pre>
+    </UiCard>
+
     <!-- Schedule Input URL Change -->
-    <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
-      <h2 class="text-lg font-semibold text-slate-900 dark:text-white mb-5">Schedule Input URL Change</h2>
+    <UiCard title="Schedule Input URL Change">
       <form @submit.prevent="requestConfirmation" class="space-y-5">
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">MediaLive Channel</label>
-          <select v-model="selectedChannelArn" required class="input-field">
+          <UiSelect v-model="selectedChannelArn" label="MediaLive Channel" required>
             <option value="">Choose a channel...</option>
-            <option v-for="channel in store.medialiveChannels" :key="channel.arn" :value="channel.arn">{{ channel.name }} ({{ channel.arn.split(':').pop() }})</option>
-          </select>
-          <input v-model="customArn" type="text" class="input-field mt-3" placeholder="Or paste a MediaLive channel ARN" />
+            <option v-for="channel in store.medialiveChannels" :key="channel.arn" :value="channel.arn">
+              {{ channel.name }} ({{ channel.arn.split(':').pop() }})
+            </option>
+          </UiSelect>
+          <UiInput v-model="customArn" placeholder="Or paste a MediaLive channel ARN" wrapper-class="mt-3" />
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div>
-            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Mode</label>
-            <select v-model="mode" class="input-field">
-              <option value="update">Update to new URL</option>
-              <option value="rollback">Rollback to last URL</option>
-            </select>
-          </div>
-          <div>
-            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Date</label>
-            <input v-model="date" type="date" required class="input-field" />
-          </div>
-          <div>
-            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Time</label>
-            <input v-model="time" type="time" required class="input-field" />
+
+        <!-- Input details display -->
+        <div v-if="inputDetails" class="rounded-lg border border-primary-200 bg-primary-50 p-4 dark:border-primary-800 dark:bg-primary-950/50">
+          <p class="text-sm font-medium text-primary-900 dark:text-primary-200">Current Input Details</p>
+          <div class="mt-2 space-y-1 font-mono text-xs text-primary-700 dark:text-primary-300">
+            <p>Channel ID: {{ inputDetails.channel_id }}</p>
+            <p>Input ID: {{ inputDetails.input_id }}</p>
+            <p>State: {{ inputDetails.state }}</p>
+            <p>Current URL: {{ inputDetails.current_url }}</p>
           </div>
         </div>
-        <div v-if="mode === 'update'">
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">New HLS URL</label>
-          <input v-model="targetUrl" type="url" required class="input-field" placeholder="https://example.com/live/playlist.m3u8" />
+
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <UiSelect v-model="mode" label="Mode">
+            <option value="update">Update to new URL</option>
+            <option value="rollback">Rollback to last URL</option>
+          </UiSelect>
+          <UiInput v-model="date" label="Date" type="date" required />
+          <UiInput v-model="time" label="Time" type="time" required />
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Timezone</label>
-            <select v-model="timezone" class="input-field">
-              <option value="UTC">UTC</option>
-              <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
-              <option value="America/New_York">America/New_York (EST)</option>
-              <option value="America/Los_Angeles">America/Los_Angeles (PST)</option>
-              <option value="Europe/London">Europe/London (GMT)</option>
-              <option value="Asia/Tokyo">Asia/Tokyo (JST)</option>
-            </select>
-          </div>
+
+        <UiInput v-if="mode === 'update'" v-model="targetUrl" label="New HLS URL" type="url" placeholder="https://example.com/live/playlist.m3u8" required />
+
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <UiSelect v-model="timezone" label="Timezone">
+            <option v-for="tz in tzOptions" :key="tz" :value="tz">{{ tz }}</option>
+          </UiSelect>
           <label class="flex items-center gap-3 pt-7 text-sm text-slate-700 dark:text-slate-300">
-            <input v-model="precheck" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+            <input v-model="precheck" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-primary-600 focus:ring-primary-500" />
             Precheck HLS playlist before update
           </label>
         </div>
 
         <!-- Token expiry scheduling warning -->
-        <div v-if="schedulePastTokenExpiry" class="bg-orange-50 dark:bg-orange-950 border border-orange-200 dark:border-orange-800 rounded-lg p-4 text-sm text-orange-800 dark:text-orange-200">
+        <div v-if="schedulePastTokenExpiry" class="rounded-lg border border-warning-200 bg-warning-50 p-4 text-sm text-warning-800 dark:border-warning-800 dark:bg-warning-950 dark:text-warning-200">
           ⚠️ <strong>Warning:</strong> The scheduled time is past the estimated AWS session token expiry. The job may fail due to expired credentials.
         </div>
 
-        <div class="flex flex-col sm:flex-row gap-3">
-          <button type="button" @click="loadInputDetails" :disabled="!selectedArn || store.loading" class="btn-secondary">Check Current Input</button>
-          <button type="submit" :disabled="!canSchedule || store.loading" class="btn-primary">{{ store.loading ? 'Scheduling...' : 'Schedule Input Change' }}</button>
-          <button type="button" @click="resetScheduleForm" class="btn-secondary">Clear</button>
+        <div class="flex flex-col gap-3 sm:flex-row">
+          <UiButton type="button" variant="secondary" :disabled="!selectedArn || store.loading" @click="loadInputDetails">Check Current Input</UiButton>
+          <UiButton type="submit" variant="primary" :disabled="!canSchedule || store.loading" :loading="store.loading">Schedule Input Change</UiButton>
+          <UiButton type="button" variant="secondary" @click="resetScheduleForm">Clear</UiButton>
         </div>
       </form>
-    </div>
+    </UiCard>
 
     <!-- MediaLive Input Jobs -->
-    <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
-      <div class="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+    <UiCard padding="none">
+      <template #header>
         <h2 class="text-lg font-semibold text-slate-900 dark:text-white">MediaLive Input Jobs</h2>
-        <button @click="store.fetchMediaLiveJobs" class="btn-secondary">Refresh</button>
-      </div>
-      <div v-if="store.medialiveJobs.length === 0" class="p-8 text-center text-slate-500 dark:text-slate-400">No MediaLive input jobs</div>
+      </template>
+      <template #actions>
+        <UiButton variant="secondary" size="sm" @click="store.fetchMediaLiveJobs">Refresh</UiButton>
+      </template>
+
+      <UiEmptyState v-if="store.medialiveJobs.length === 0" icon="list" message="No MediaLive input jobs" class="py-8" />
+
       <div v-else class="divide-y divide-slate-200 dark:divide-slate-700">
-        <div v-for="job in store.medialiveJobs" :key="job.id" class="p-5">
+        <div
+          v-for="job in store.medialiveJobs"
+          :key="job.id"
+          :class="['border-l-4 p-5', mlJobBorderClass(job.status)]"
+        >
           <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
             <div class="min-w-0">
               <p class="font-semibold text-slate-900 dark:text-white">{{ job.name }}</p>
-              <p class="text-xs text-slate-500 dark:text-slate-400 break-all">{{ job.arn }}</p>
-              <p class="text-sm text-slate-600 dark:text-slate-300 mt-2">{{ job.mode === 'rollback' ? 'Rollback' : 'Update' }} scheduled {{ job.time_until }}</p>
-              <p v-if="job.target_url" class="text-xs text-slate-500 dark:text-slate-400 break-all mt-1">{{ job.target_url }}</p>
+              <p class="break-all text-xs text-slate-500 dark:text-slate-400">{{ job.arn }}</p>
+              <p class="mt-2 text-sm text-slate-600 dark:text-slate-300">{{ job.mode === 'rollback' ? 'Rollback' : 'Update' }} scheduled {{ job.time_until }}</p>
+              <p v-if="job.target_url" class="mt-1 break-all text-xs text-slate-500 dark:text-slate-400">{{ job.target_url }}</p>
             </div>
             <div class="flex items-center gap-2">
-              <span :class="statusBadgeClass(job.status)">{{ formatStatus(job.status) }}</span>
-              <button @click="toggleLogs(job.id)" class="btn-secondary">Logs</button>
-              <button v-if="job.status === 'waiting' || job.status === 'running'" @click="store.cancelMediaLiveJob(job.id)" class="btn-danger">Cancel</button>
+              <UiBadge :status="job.status" />
+              <UiButton variant="secondary" size="sm" @click="toggleLogs(job.id)">Logs</UiButton>
+              <UiButton
+                v-if="job.status === 'waiting' || job.status === 'running'"
+                variant="danger"
+                size="sm"
+                @click="store.cancelMediaLiveJob(job.id)"
+              >Cancel</UiButton>
             </div>
           </div>
-          <pre v-if="openLogJob === job.id" class="mt-4 whitespace-pre-wrap rounded-lg bg-slate-950 text-slate-100 p-4 text-xs overflow-x-auto">{{ jobLogs }}</pre>
+          <pre v-if="openLogJob === job.id" class="mt-4 overflow-x-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-4 text-xs text-slate-100">{{ jobLogs }}</pre>
         </div>
       </div>
-    </div>
+    </UiCard>
 
     <!-- Confirmation Modal -->
     <ConfirmModal
@@ -166,15 +177,24 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useStore } from '../stores/main'
-import { formatStatus, statusBadgeClass } from '../utils/status'
+import { detectTimezone, timezoneOptions } from '../utils/timezone'
+import { ChevronDown } from 'lucide-vue-next'
 import ConfirmModal from './ConfirmModal.vue'
+import UiCard from './ui/UiCard.vue'
+import UiButton from './ui/UiButton.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
+import UiBadge from './ui/UiBadge.vue'
+import UiEmptyState from './ui/UiEmptyState.vue'
 
 const store = useStore()
 const selectedChannelArn = ref('')
 const customArn = ref('')
 const mode = ref('update')
 const targetUrl = ref('')
-const timezone = ref('Asia/Kolkata')
+const detectedTz = detectTimezone()
+const timezone = ref(detectedTz)
+const tzOptions = timezoneOptions(detectedTz)
 const date = ref('')
 const time = ref('')
 const precheck = ref(true)
@@ -187,6 +207,9 @@ const pasteInput = ref('')
 const pasteStatus = ref('')
 
 const awsForm = reactive({ access_key_id: '', secret_access_key: '', session_token: '', region: 'us-east-1' })
+
+// Collapse paste area when credentials are already configured; expand when not
+const showPasteHelper = ref(!store.awsCredentials?.configured)
 
 const selectedChannelObj = computed(() => {
   if (!selectedChannelArn.value) return null
@@ -219,6 +242,18 @@ const schedulePastTokenExpiry = computed(() => {
   const scheduledAt = new Date(`${date.value}T${time.value}:00`).getTime()
   return scheduledAt > expiresAt
 })
+
+// Status left border for ML jobs
+const mlJobBorderClass = (status: string) => {
+  const map: Record<string, string> = {
+    waiting: 'border-l-warning-400',
+    running: 'border-l-primary-500',
+    done: 'border-l-success-500',
+    failed: 'border-l-danger-500',
+    cancelled: 'border-l-slate-300 dark:border-l-slate-600',
+  }
+  return map[status] ?? 'border-l-slate-200 dark:border-l-slate-700'
+}
 
 // Credential paste parser
 const parsePastedCredentials = () => {
