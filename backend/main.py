@@ -349,11 +349,26 @@ def list_medialive_jobs() -> List[Dict[str, Any]]:
     """Get MediaLive input URL jobs."""
     jobs = load_medialive_jobs()
     result = []
+    dirty = False
 
     for job_id, job in jobs.items():
         status = job.get("status", "unknown")
+
+        # Same fix as regular jobs: only mark failed if the scheduled time has
+        # already passed AND the worker process is gone. This prevents falsely
+        # overriding a persisted "done" status after a server restart.
         if status == "waiting" and not is_process_alive(job.get("pid", 0)):
-            status = "failed"
+            scheduled = job.get("time", "")
+            try:
+                sched_dt = datetime.datetime.fromisoformat(scheduled)
+                if sched_dt.tzinfo is None:
+                    sched_dt = sched_dt.replace(tzinfo=datetime.timezone.utc)
+                if sched_dt < datetime.datetime.now(datetime.timezone.utc):
+                    status = "failed"
+                    jobs[job_id]["status"] = "failed"
+                    dirty = True
+            except Exception:
+                pass
 
         result.append({
             "id": job_id,
@@ -366,6 +381,9 @@ def list_medialive_jobs() -> List[Dict[str, Any]]:
             "time_until": format_time_until(job.get("time", "")),
             "pid": job.get("pid"),
         })
+
+    if dirty:
+        save_medialive_jobs(jobs)
 
     return result
 
@@ -486,14 +504,31 @@ def list_jobs() -> List[Dict[str, Any]]:
     """Get all jobs"""
     jobs = load_jobs()
     result = []
+    dirty = False  # Track if we need to persist any status corrections
 
     for job_id, job in jobs.items():
         name = job.get("name") or job.get("arn", "").split(":")[-1]
         status = job.get("status", "unknown")
 
-        # Check if process is still alive
+        # Only mark failed if:
+        #   1. Status is still "waiting" (worker never updated it), AND
+        #   2. The scheduled time is in the past (so the worker should have run), AND
+        #   3. The worker process is no longer alive
+        # This prevents falsely overriding a persisted "done"/"failed" after a server restart.
         if status == "waiting" and not is_alive(job.get("pid", 0)):
-            status = "failed"
+            scheduled = job.get("time", "")
+            try:
+                sched_dt = datetime.datetime.fromisoformat(scheduled)
+                if sched_dt.tzinfo is None:
+                    sched_dt = sched_dt.replace(tzinfo=datetime.timezone.utc)
+                if sched_dt < datetime.datetime.now(datetime.timezone.utc):
+                    # Scheduled time passed but status never updated → worker died unexpectedly
+                    status = "failed"
+                    jobs[job_id]["status"] = "failed"
+                    dirty = True
+                # else: scheduled time is still in the future, so the worker is just sleeping
+            except Exception:
+                pass
 
         result.append({
             "id": job_id,
@@ -504,6 +539,9 @@ def list_jobs() -> List[Dict[str, Any]]:
             "time_until": format_time_until(job.get("time", "")),
             "pid": job.get("pid")
         })
+
+    if dirty:
+        save_jobs(jobs)
 
     return result
 
@@ -520,7 +558,17 @@ def get_job(job_id: str) -> Dict[str, Any]:
     status = job.get("status", "unknown")
 
     if status == "waiting" and not is_alive(job.get("pid", 0)):
-        status = "failed"
+        scheduled = job.get("time", "")
+        try:
+            sched_dt = datetime.datetime.fromisoformat(scheduled)
+            if sched_dt.tzinfo is None:
+                sched_dt = sched_dt.replace(tzinfo=datetime.timezone.utc)
+            if sched_dt < datetime.datetime.now(datetime.timezone.utc):
+                status = "failed"
+                jobs[job_id]["status"] = "failed"
+                save_jobs(jobs)
+        except Exception:
+            pass
 
     return {
         "id": job_id,
