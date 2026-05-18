@@ -157,32 +157,70 @@ def restart_api(arn: str):
 
 # ================= LOGIC =================
 
-def wait_for_running(arn: str, timeout=180):
+# MediaLive channels can take 5-8 min to cycle STOPPING → IDLE → STARTING → RUNNING.
+# Give each wait up to 10 minutes so we never time-out a healthy restart.
+_RUNNING_TIMEOUT = 600  # seconds
+_TRANSITION_STATES = frozenset({"STOPPING", "STARTING", "UNKNOWN"})
+
+
+def wait_for_running(arn: str, timeout: int = _RUNNING_TIMEOUT, write=None) -> bool:
+    """Poll until the channel is RUNNING or timeout is exceeded.
+
+    During STOPPING / STARTING the channel is still in a valid transition;
+    we never give up while the channel is actively moving through states.
+    Pass a ``write`` callable to get live state-change log entries.
+    """
+    _log = write if callable(write) else lambda msg: None
     start = time.time()
+    last_state = ""
 
     while time.time() - start < timeout:
-        state = get_status(arn)
+        try:
+            state = get_status(arn)
+        except Exception as exc:
+            # Transient API error — keep waiting
+            _log(f"Status check error (retrying): {exc}")
+            time.sleep(10)
+            continue
+
+        if state != last_state:
+            _log(f"Channel state: {state}")
+            last_state = state
 
         if state == "RUNNING":
             return True
 
-        time.sleep(5)
+        # Channel is still transitioning — keep polling
+        time.sleep(10)
 
+    _log(f"Timed out after {timeout}s waiting for RUNNING (last state: {last_state})")
     return False
 
 
-def restart_with_retry(arn: str, retries=5):
+def restart_with_retry(arn: str, retries: int = 3, write=None) -> bool:
+    """Call the restart API and wait for the channel to be RUNNING.
+
+    Each attempt gets its own full ``_RUNNING_TIMEOUT`` window so a slow
+    MediaLive cycle doesn't count as a failure.
+    """
+    _log = write if callable(write) else lambda msg: None
     for i in range(1, retries + 1):
+        _log(f"Restart attempt {i}/{retries}")
         try:
             restart_api(arn)
-        except Exception:
-            time.sleep(5)
+            _log("Restart API call accepted")
+        except Exception as exc:
+            _log(f"Restart API error: {exc}")
+            time.sleep(10)
             continue
 
-        time.sleep(10)
+        # Brief pause for the restart to be accepted before we start polling
+        time.sleep(15)
 
-        if wait_for_running(arn):
+        if wait_for_running(arn, write=_log):
             return True
+
+        _log(f"Attempt {i} did not reach RUNNING, {'retrying' if i < retries else 'giving up'}")
 
     return False
 
@@ -223,8 +261,9 @@ def daemon_worker(job_id: str, arn: str, name: str, delay: float):
 
             logger.write(f"Restarting {name}")
             logger.write(f"ARN: {arn}")
+            logger.write(f"Waiting up to {_RUNNING_TIMEOUT}s for channel to reach RUNNING")
 
-            success = restart_with_retry(arn)
+            success = restart_with_retry(arn, write=logger.write)
 
             jobs = load_jobs()
             jobs[job_id]["status"] = "done" if success else "failed"

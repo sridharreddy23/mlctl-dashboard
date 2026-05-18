@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import signal
+import sys
 import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -20,13 +21,26 @@ def get_app_dir() -> Path:
     """Return (and create) the application data directory.
 
     Uses ``~/.mlctl`` by default, overridable via the
-    ``MLCTL_DATA_DIR`` environment variable.
+    ``MLCTL_DATA_DIR`` environment variable.  If the configured
+    directory cannot be created (e.g. permission denied), the code
+    warns and falls back to ``~/.mlctl`` so the process always starts.
     """
     base = os.environ.get("MLCTL_DATA_DIR", "")
     if base:
         p = Path(base)
-    else:
-        p = Path.home() / ".mlctl"
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(p), 0o700)
+            return p
+        except PermissionError:
+            print(
+                f"[mlctl] WARNING: Cannot create/access MLCTL_DATA_DIR={base!r} "
+                f"(permission denied). Falling back to ~/.mlctl",
+                file=sys.stderr,
+            )
+
+    # Default / fallback path
+    p = Path.home() / ".mlctl"
     p.mkdir(parents=True, exist_ok=True)
     os.chmod(str(p), 0o700)
     return p
