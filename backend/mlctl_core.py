@@ -26,8 +26,8 @@ class MLCtlConfig:
     def __init__(self):
         self.client_id = os.environ.get("ML_CLIENT_ID", "")
         self.client_secret = os.environ.get("ML_CLIENT_SECRET", "")
-        self.base_url = os.environ.get("ML_BASE_URL", "")
-        self.blip_domain = os.environ.get("ML_BLIP_DOMAIN", "")
+        self.base_url = os.environ.get("ML_BASE_URL", "").rstrip("/")
+        self.blip_domain = os.environ.get("ML_BLIP_DOMAIN", "").strip("/")
         self.token_buffer = 60
 
     def is_configured(self) -> bool:
@@ -123,7 +123,7 @@ def get_status_with_token(arn: str, token: str, timeout: int = 12) -> str:
     if not arn or not arn.strip():
         raise ValueError("Channel ARN is required")
 
-    url = f"{config.base_url.rstrip('/')}/cloudport/medialive/{config.blip_domain}/status"
+    url = f"{config.base_url}/cloudport/medialive/{config.blip_domain}/status"
     resp = requests.get(
         url,
         params={"arn": arn.strip()},
@@ -150,7 +150,7 @@ def restart_api(arn: str):
         f"{config.base_url}/cloudport/medialive/{config.blip_domain}/restart",
         headers={"Authorization": f"Bearer {token}"},
         json={"arn": arn},
-        timeout=15,
+        timeout=45,  # API can be slow to respond; 15s was causing false timeouts
     )
     resp.raise_for_status()
 
@@ -200,27 +200,38 @@ def wait_for_running(arn: str, timeout: int = _RUNNING_TIMEOUT, write=None) -> b
 def restart_with_retry(arn: str, retries: int = 3, write=None) -> bool:
     """Call the restart API and wait for the channel to be RUNNING.
 
-    Each attempt gets its own full ``_RUNNING_TIMEOUT`` window so a slow
-    MediaLive cycle doesn't count as a failure.
+    Timeout handling: the restart API sometimes takes >15s to respond but
+    the request IS accepted on the server side. On a ReadTimeout we treat
+    the restart as likely triggered and go straight to polling instead of
+    retrying (which would cause 400s because the channel is already stopping).
     """
     _log = write if callable(write) else lambda msg: None
     for i in range(1, retries + 1):
         _log(f"Restart attempt {i}/{retries}")
+        api_accepted = False
         try:
             restart_api(arn)
             _log("Restart API call accepted")
+            api_accepted = True
+        except requests.exceptions.Timeout:
+            # Server likely accepted the request but took too long to reply.
+            # Go straight to polling — do NOT retry or we'll get 400 (channel already stopping).
+            _log("Restart API timed out — assuming request was accepted, polling for RUNNING")
+            api_accepted = True
         except Exception as exc:
             _log(f"Restart API error: {exc}")
-            time.sleep(10)
-            continue
+            if i < retries:
+                time.sleep(10)
+                continue
+            else:
+                break
 
-        # Brief pause for the restart to be accepted before we start polling
-        time.sleep(15)
-
-        if wait_for_running(arn, write=_log):
-            return True
-
-        _log(f"Attempt {i} did not reach RUNNING, {'retrying' if i < retries else 'giving up'}")
+        if api_accepted:
+            # Brief pause before polling so the channel has time to begin transitioning
+            time.sleep(15)
+            if wait_for_running(arn, write=_log):
+                return True
+            _log(f"Attempt {i} did not reach RUNNING, {'retrying' if i < retries else 'giving up'}")
 
     return False
 

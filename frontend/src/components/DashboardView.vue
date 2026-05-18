@@ -37,34 +37,6 @@
 
     <ChannelStatusGrid />
 
-    <!-- First-run onboarding -->
-    <UiCard v-if="showOnboarding" class="border-2 border-dashed border-primary-300 dark:border-primary-700">
-      <div class="text-center sm:text-left">
-        <h3 class="text-lg font-semibold text-slate-900 dark:text-white">Welcome to MLCtl Dashboard</h3>
-        <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Complete these steps to get started.</p>
-        <ol class="mt-4 space-y-3">
-          <li class="flex items-center gap-3 text-sm">
-            <CheckCircle2 class="h-5 w-5 text-success-500" />
-            <span class="text-slate-700 dark:text-slate-300">Dashboard is running</span>
-          </li>
-          <li class="flex items-center gap-3 text-sm">
-            <CheckCircle2 v-if="store.config?.configured" class="h-5 w-5 text-success-500" />
-            <Circle v-else class="h-5 w-5 text-slate-300 dark:text-slate-600" />
-            <RouterLink to="/settings" class="text-primary-600 hover:underline dark:text-primary-400">Configure API credentials</RouterLink>
-          </li>
-          <li class="flex items-center gap-3 text-sm">
-            <CheckCircle2 v-if="store.channels.length > 0" class="h-5 w-5 text-success-500" />
-            <Circle v-else class="h-5 w-5 text-slate-300 dark:text-slate-600" />
-            <RouterLink to="/settings" class="text-primary-600 hover:underline dark:text-primary-400">Load channels</RouterLink>
-          </li>
-          <li class="flex items-center gap-3 text-sm">
-            <CheckCircle2 v-if="store.jobs.length > 0" class="h-5 w-5 text-success-500" />
-            <Circle v-else class="h-5 w-5 text-slate-300 dark:text-slate-600" />
-            <RouterLink to="/schedule" class="text-primary-600 hover:underline dark:text-primary-400">Schedule your first restart</RouterLink>
-          </li>
-        </ol>
-      </div>
-    </UiCard>
 
     <UiCard title="Active Jobs">
       <UiEmptyState
@@ -121,7 +93,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { RouterLink } from 'vue-router'
-import { Briefcase, PlayCircle, CheckCircle2, XCircle, Clock, History, RefreshCw, Circle } from 'lucide-vue-next'
+import { Briefcase, PlayCircle, CheckCircle2, XCircle, Clock, History, RefreshCw } from 'lucide-vue-next'
 import { useStore } from '../stores/main'
 import { humanizeRelativeTime } from '../utils/status'
 import ChannelStatusGrid from './ChannelStatusGrid.vue'
@@ -158,9 +130,6 @@ const total = computed(() => store.jobs.length || 1)
 const completedCount = computed(() => store.jobs.filter(j => j.status === 'done').length)
 const failedCount = computed(() => store.jobs.filter(j => j.status === 'failed').length)
 
-const showOnboarding = computed(() =>
-  !store.config?.configured || store.channels.length === 0 || store.jobs.length === 0
-)
 
 const pct = (n: number) => `${Math.round((n / total.value) * 100)}%`
 

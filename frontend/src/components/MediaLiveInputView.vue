@@ -80,7 +80,16 @@
             <p>Channel ID: {{ inputDetails.channel_id }}</p>
             <p>Input ID: {{ inputDetails.input_id }}</p>
             <p>State: {{ inputDetails.state }}</p>
-            <p>Current URL: {{ inputDetails.current_url }}</p>
+            <div class="flex items-start gap-2">
+              <span class="shrink-0">Current URL:</span>
+              <span class="min-w-0 break-all">{{ inputDetails.current_url }}</span>
+              <button
+                type="button"
+                class="ml-auto shrink-0 rounded px-1.5 py-0.5 text-xs text-primary-600 hover:bg-primary-100 dark:text-primary-400 dark:hover:bg-primary-900"
+                title="Copy URL"
+                @click="copyCurrentUrl"
+              >Copy</button>
+            </div>
           </div>
         </div>
 
@@ -300,6 +309,17 @@ const credentialPayload = () => ({ access_key_id: awsForm.access_key_id, secret_
 const saveAwsCredentials = async () => { await store.updateAwsCredentials(credentialPayload()) }
 const showExportCommands = async () => { exportCommands.value = await store.getAwsExportCommands() }
 const loadInputDetails = async () => { inputDetails.value = await store.getMediaLiveInputDetails({ ...credentialPayload(), arn: selectedArn.value }) }
+
+const copyCurrentUrl = async () => {
+  const url = inputDetails.value?.current_url
+  if (!url) return
+  try {
+    await navigator.clipboard.writeText(url)
+    store.addToast('URL copied', 'success', 2000)
+  } catch {
+    store.addToast('Could not copy URL', 'error', 2000)
+  }
+}
 
 const requestConfirmation = () => {
   if (!canSchedule.value) return
